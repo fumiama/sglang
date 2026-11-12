@@ -805,6 +805,16 @@ def torch_w8a8_block_fp8_linear(
         q_input = input_2d
         activation_scale = input_scale.reshape(-1, input_scale.shape[-1])
 
+    if block_n == 128 and _is_xpu and weight.shape[0] % 128 == 0:
+        # The sgl-kernel CUTLASS kernel requires N and K multiples of 128
+        # (small-N layers like the GDN in_proj_ba of Qwen3.8, N=96, must stay
+        # on the scaled_mm path).
+        min_m = envs.SGLANG_XPU_BLOCK_FP8_SGL_KERNEL_MIN_M.get()
+        if min_m is not None and bias is None and q_input.shape[0] >= min_m:
+            return _xpu_sgl_kernel_block_fp8_mm(
+                q_input, weight, activation_scale, weight_scale, input
+            )
+
     if q_input.stride(-1) != 1:
         q_input = q_input.contiguous()
     if weight.stride(-1) != 1:
@@ -822,6 +832,61 @@ def torch_w8a8_block_fp8_linear(
         output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
     return output.view(*input.shape[:-1], weight.shape[0])
+
+
+def _xpu_sgl_kernel_block_fp8_mm(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input: torch.Tensor,
+) -> torch.Tensor:
+    """Mid/large-M branch of the XPU block-FP8 linear: sgl-kernel CUTLASS
+    fp8_blockwise_scaled_mm instead of F.scaled_mm.
+
+    On CRI the two kernels have complementary tile tables (qwen38 research
+    item 07): F.scaled_mm (serving layout, B column-major) wins M<=128, CUTLASS
+    wins M>=256 by ~2x on the wide-N shapes where the M=256 F.scaled_mm tiles
+    are pathological; selected per forward by
+    SGLANG_XPU_BLOCK_FP8_SGL_KERNEL_MIN_M. Layouts the kernel requires
+    (src/sycl/xe35/fp8_blockwise_gemm.cpp TORCH_CHECKs): A [M, K] row-major
+    fp8, B [K, N] column-major fp8 (zero-copy view of the (N, K) weight),
+    scales_a [M, K/128] M-major (a tiny per-call copy; the group-quant kernel
+    could emit that layout directly instead), scales_b [K/128, N/128] K-major
+    (one copy per layer, cached below).
+    """
+    fp8_blockwise_scaled_mm = _xpu_sgl_kernel_fp8_blockwise_scaled_mm()
+    k = weight.shape[1]
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+    if scale_a.stride(0) != 1:
+        scale_a = scale_a.t().contiguous().t()
+    # The [K-blocks, N-blocks] K-major (stride(0)==1) weight-scale copy the
+    # sgl-kernel CUTLASS fp8_blockwise_scaled_mm expects, cached ON the layer
+    # -owned weight_scale tensor so its lifetime is exactly the key's (no
+    # weak-vs-equals dict pitfalls, no staleness if the scale is replaced).
+    # The copy is N*K/16384 bytes, once per layer.
+    scale_b = getattr(weight_scale, "_sgl_kernel_scale_b", None)
+    if scale_b is None:
+        scale_b = torch.empty_strided(
+            (k // 128, weight.shape[0] // 128),
+            (1, k // 128),
+            dtype=weight_scale.dtype,
+            device=weight_scale.device,
+        )
+        scale_b.copy_(weight_scale.t())
+        weight_scale._sgl_kernel_scale_b = scale_b
+    output = fp8_blockwise_scaled_mm(
+        q_input, weight.t(), scale_a, scale_b, torch.bfloat16
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
+
+
+@lru_cache(maxsize=1)
+def _xpu_sgl_kernel_fp8_blockwise_scaled_mm() -> Callable:
+    from sgl_kernel import fp8_blockwise_scaled_mm
+
+    return fp8_blockwise_scaled_mm
 
 
 def prepare_xpu_block_scale_for_scaled_mm(

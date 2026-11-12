@@ -1257,6 +1257,18 @@ class Envs:
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # ===================================================================
+    # Intel XPU
+    # ===================================================================
+    # XPU block-FP8 linear (weight_block_size [128, 128]): minimum token
+    # count M from which torch F.scaled_mm is swapped for the sgl-kernel
+    # CUTLASS fp8_blockwise_scaled_mm. Unset (default) keeps F.scaled_mm for
+    # every M. The two kernels have complementary tile tables on CRI (qwen38
+    # research item 07): F.scaled_mm wins M<=128, CUTLASS wins M>=256 by ~2x
+    # on the wide-N shapes where the M=256 F.scaled_mm tiles are pathological;
+    # 192 separates the measured tables. Only takes effect on Intel XPU.
+    SGLANG_XPU_BLOCK_FP8_SGL_KERNEL_MIN_M = EnvInt(None)
+
+    # ===================================================================
     # Quantization
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
