@@ -1124,7 +1124,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
-        elif backend.is_xpu_scaled_mm():
+        elif backend.is_xpu_scaled_mm() or (backend.is_auto() and _is_xpu):
             # torch scaled_mm reads the canonical [N, K // 32] ue8m0 bytes in
             # weight_scale_inv directly; no backend-specific layout to prepare.
             return

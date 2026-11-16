@@ -193,6 +193,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "aiter",
     "halops",
     "xpu_scaled_mm",
+    "xpu_cutlass",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
