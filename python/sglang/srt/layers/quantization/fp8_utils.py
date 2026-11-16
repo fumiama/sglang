@@ -448,6 +448,7 @@ class Fp8GemmRunnerBackend(Enum):
     AITER = "aiter"
     HALOPS = "halops"
     XPU_SCALED_MM = "xpu_scaled_mm"
+    XPU_CUTLASS = "xpu_cutlass"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -481,6 +482,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_xpu_scaled_mm(self) -> bool:
         return self == Fp8GemmRunnerBackend.XPU_SCALED_MM
+
+    def is_xpu_cutlass(self) -> bool:
+        return self == Fp8GemmRunnerBackend.XPU_CUTLASS
 
 
 class Mxfp8DenseGemmBackend(Enum):
@@ -771,15 +775,14 @@ def dispatch_w8a8_block_fp8_linear(
     return linear
 
 
-def torch_w8a8_block_fp8_linear(
+def _xpu_w8a8_block_fp8_quantize(
     input: torch.Tensor,
-    weight: torch.Tensor,
     block_size: List[int],
-    weight_scale: torch.Tensor,
-    input_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Run block-FP8 linear with Torch's scaled_mm implementation."""
+    input_scale: Optional[torch.Tensor],
+) -> tuple[int, int, torch.Tensor, torch.Tensor]:
+    """Validate weight_block_size and quantize the activation of the XPU
+    block-FP8 paths. Returns (block_n, block_k, q_input [M, K] fp8,
+    activation_scale [M, K // block_k])."""
     if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
         raise ValueError(
             f"XPU block-FP8 scaled_mm expects a two-dimensional weight_block_size, "
@@ -792,17 +795,33 @@ def torch_w8a8_block_fp8_linear(
             f"[128, 128], but got {block_size}"
         )
 
-    scale_b_recipe = (
-        torch.nn.functional.ScalingType.BlockWise1x128
-        if block_n == 1
-        else torch.nn.functional.ScalingType.BlockWise128x128
-    )
     input_2d = input.reshape(-1, input.shape[-1])
     if input_scale is None:
         q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
     else:
         q_input = input_2d
         activation_scale = input_scale.reshape(-1, input_scale.shape[-1])
+    return block_n, block_k, q_input, activation_scale
+
+
+def torch_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run block-FP8 linear with Torch's scaled_mm implementation."""
+    block_n, _, q_input, activation_scale = _xpu_w8a8_block_fp8_quantize(
+        input, block_size, input_scale
+    )
+
+    scale_b_recipe = (
+        torch.nn.functional.ScalingType.BlockWise1x128
+        if block_n == 1
+        else torch.nn.functional.ScalingType.BlockWise128x128
+    )
 
     if q_input.stride(-1) != 1:
         q_input = q_input.contiguous()
@@ -823,6 +842,178 @@ def torch_w8a8_block_fp8_linear(
     return output.view(*input.shape[:-1], weight.shape[0])
 
 
+# Measured on Intel BMG-class XPU with block-FP8 checkpoints: the two kernels
+# below have complementary tile tables -- torch scaled_mm wins below M~128 by
+# ~2.7x, the sgl-kernel CUTLASS kernel wins at M=256 by ~2x (there scaled_mm
+# tiles are pathological on the wide-N linears). M between 128 and 256 is
+# unmeasured, so the threshold sits at the measured operating point; re-tune
+# when either kernel changes.
+_XPU_CUTLASS_MIN_M = 256
+
+
+@lru_cache(maxsize=1)
+def _xpu_sgl_kernel_fp8_blockwise_scaled_mm() -> Optional[Callable]:
+    """Return sgl-kernel's fp8_blockwise_scaled_mm, or None when the installed
+    wheel does not ship the registered op. The sgl_kernel module always defines
+    the wrapper function, but wheels before the op landed fail the op lookup at
+    call time, so probe the registration here."""
+    try:
+        from sgl_kernel import fp8_blockwise_scaled_mm
+
+        torch.ops.sgl_kernel.fp8_blockwise_scaled_mm.default  # noqa: B018
+        return fp8_blockwise_scaled_mm
+    except (ImportError, AttributeError):
+        return None
+
+
+def xpu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Default XPU block-FP8 linear: route each forward between torch
+    scaled_mm and sgl-kernel CUTLASS by M (see _XPU_CUTLASS_MIN_M)."""
+    return _xpu_w8a8_block_fp8_linear(
+        input=input,
+        weight=weight,
+        block_size=block_size,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        bias=bias,
+        min_m=_XPU_CUTLASS_MIN_M,
+    )
+
+
+def xpu_cutlass_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run XPU block-FP8 linear on sgl-kernel CUTLASS whenever the shapes
+    allow it; only layers the kernel rejects stay on scaled_mm."""
+    return _xpu_w8a8_block_fp8_linear(
+        input=input,
+        weight=weight,
+        block_size=block_size,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        bias=bias,
+        min_m=0,
+    )
+
+
+def _xpu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    min_m: int,
+) -> torch.Tensor:
+    """XPU block-FP8 linear, taking the sgl-kernel CUTLASS branch when M
+    reaches min_m and the kernel can serve the shapes, else torch scaled_mm."""
+    block_n, _, q_input, activation_scale = _xpu_w8a8_block_fp8_quantize(
+        input, block_size, input_scale
+    )
+    if (
+        q_input.shape[0] >= min_m
+        and block_n == 128
+        and bias is None
+        and _xpu_sgl_kernel_fp8_blockwise_scaled_mm() is not None
+        # The CUTLASS kernel requires N and K multiples of 128; small-N layers
+        # like the GDN in_proj_ba of Qwen3.8 (N=96) stay on scaled_mm.
+        and weight.shape[0] % 128 == 0
+        and weight.shape[1] % 128 == 0
+    ):
+        return _xpu_sgl_kernel_block_fp8_mm(
+            q_input=q_input,
+            weight=weight,
+            scale_a=activation_scale,
+            weight_scale=weight_scale,
+            input=input,
+        )
+
+    scale_b_recipe = (
+        torch.nn.functional.ScalingType.BlockWise1x128
+        if block_n == 1
+        else torch.nn.functional.ScalingType.BlockWise128x128
+    )
+    if q_input.stride(-1) != 1:
+        q_input = q_input.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+    weight_t = weight.t()
+    scale_b = weight_scale if block_n == 1 else weight_scale.t()
+    output = torch.nn.functional.scaled_mm(
+        q_input,
+        weight_t,
+        activation_scale,
+        torch.nn.functional.ScalingType.BlockWise1x128,
+        scale_b,
+        scale_b_recipe,
+        bias=bias,
+        output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
+
+
+def _xpu_sgl_kernel_block_fp8_mm(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input: torch.Tensor,
+) -> torch.Tensor:
+    """CUTLASS branch of the XPU block-FP8 linear (fp8_blockwise_scaled_mm).
+
+    Layouts the kernel requires (src/sycl/xe35/fp8_blockwise_gemm.cpp
+    TORCH_CHECKs): A [M, K] row-major fp8, B [K, N] column-major fp8 (a
+    zero-copy view of the [N, K] weight), scales_a [M, K // 128] M-major,
+    scales_b [K // 128, N // 128] K-major.
+    """
+    fp8_blockwise_scaled_mm = _xpu_sgl_kernel_fp8_blockwise_scaled_mm()
+    k = weight.shape[1]
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+    if scale_a.stride(0) != 1:
+        scale_a = scale_a.t().contiguous().t()
+    # TODO(perf): per-call copy of scale_a; the group-quant kernel could emit
+    # the M-major layout directly instead.
+    scale_b = getattr(weight_scale, "_xpu_cutlass_scale_b", None)
+    if scale_b is None:
+        # scale_b lives in the other storage order than the one prepared for
+        # scaled_mm, so it gets its own copy. Cached on the layer-owned
+        # weight_scale tensor: the copy is N*K/16384 bytes, once per layer.
+        scale_b = torch.empty_strided(
+            (k // 128, weight.shape[0] // 128),
+            (1, k // 128),
+            dtype=weight_scale.dtype,
+            device=weight_scale.device,
+        )
+        scale_b.copy_(weight_scale.t())
+        weight_scale._xpu_cutlass_scale_b = scale_b
+    output = fp8_blockwise_scaled_mm(
+        q_input, weight.t(), scale_a, scale_b, torch.bfloat16
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
+
+
+# XPU linear implementations whose scaled_mm branch consumes the reordered
+# scale layout below.
+_XPU_SCALED_MM_LINEAR_FNS = (
+    torch_w8a8_block_fp8_linear,
+    xpu_w8a8_block_fp8_linear,
+    xpu_cutlass_w8a8_block_fp8_linear,
+)
+
+
 def prepare_xpu_block_scale_for_scaled_mm(
     weight_scale: torch.Tensor,
     block_size: List[int],
@@ -834,7 +1025,7 @@ def prepare_xpu_block_scale_for_scaled_mm(
     # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
     # This avoids a per-forward contiguous/copy in either path.
     if (
-        linear_fn is not torch_w8a8_block_fp8_linear
+        linear_fn not in _XPU_SCALED_MM_LINEAR_FNS
         or not isinstance(block_size, (list, tuple))
         or tuple(block_size) not in ((1, 128), (128, 128))
         or weight_scale.ndim != 2
@@ -1309,6 +1500,20 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
             )
         return torch_w8a8_block_fp8_linear
 
+    elif backend.is_xpu_cutlass():
+        if not _is_xpu:
+            raise RuntimeError(
+                "FP8 GEMM requested via --fp8-gemm-backend=xpu_cutlass, "
+                "but that backend requires an Intel XPU."
+            )
+        if _xpu_sgl_kernel_fp8_blockwise_scaled_mm() is None:
+            raise RuntimeError(
+                "FP8 GEMM requested via --fp8-gemm-backend=xpu_cutlass, "
+                "but the installed sgl-kernel wheel has no "
+                "fp8_blockwise_scaled_mm."
+            )
+        return xpu_cutlass_w8a8_block_fp8_linear
+
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
@@ -1345,6 +1550,8 @@ def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
 
         return npu_w8a8_mxfp8_linear
     elif _is_xpu:
+        if _xpu_sgl_kernel_fp8_blockwise_scaled_mm() is not None:
+            return xpu_w8a8_block_fp8_linear
         return torch_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
@@ -1360,9 +1567,6 @@ def initialize_fp8_gemm_config() -> None:
     elif backend == "auto" and get_platform().is_sm110:
         # DeepGEMM's block-FP8 kernel does not support SM110.
         backend = "triton"
-    elif backend == "auto" and get_platform().is_xpu:
-        backend = "xpu_scaled_mm"
-
     backend = Fp8GemmRunnerBackend(backend)
 
     FP8_GEMM_RUNNER_BACKEND = backend
